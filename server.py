@@ -37,19 +37,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from src.auth import (
     google_auth_url,
     google_exchange_code,
-    get_authorization_url,
-    exchange_code,
-    get_credentials,
     credentials_from_token_data,
 )
 from src.storage import (
-    # OAuth server
     save_client, load_client,
     save_oauth_session, load_oauth_session, delete_oauth_session,
     save_auth_code, load_auth_code, delete_auth_code,
     save_access_token, load_access_token, update_access_token,
-    # legacy
-    list_users, delete_token,
 )
 import src.ga_tools as ga
 
@@ -406,37 +400,13 @@ async def oauth_callback(request: Request, code: Optional[str] = None, state: Op
         return HTMLResponse(f"<h1>Authorized</h1><p>Code: <code>{auth_code}</code></p>")
 
     else:
-        # ── Legacy manual flow OR session lost (server restart) ──
-        # If the state looks like it came from a registered client (no ":" separator),
-        # redirect to a known error page rather than attempting a wrong exchange.
-        if state and ":" not in state and redirect_uri is None:
-            return HTMLResponse(
-                "<h1>Session Expired</h1>"
-                "<p>The OAuth session was lost (server may have restarted). "
-                "Please start the connection again from claude.ai.</p>",
-                status_code=400,
-            )
-        try:
-            creds, user_id = exchange_code(code=code, state=state or "")
-            from src.storage import get_or_create_api_key
-            api_key = get_or_create_api_key(user_id)
-            return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><title>GA MCP — Authenticated</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:700px;margin:60px auto;padding:0 20px}}
-code{{background:#f0f0f0;padding:4px 8px;border-radius:4px}}
-pre{{background:#1e1e1e;color:#d4d4d4;padding:20px;border-radius:8px;overflow-x:auto}}
-.ok{{color:#16a34a;font-weight:bold;font-size:1.2em}}
-.warn{{background:#fef3c7;border:1px solid #f59e0b;padding:12px;border-radius:6px;margin:8px 0}}</style>
-</head><body>
-<p class="ok">✓ Authenticated!</p>
-<p>User ID: <code>{user_id}</code></p>
-<h2>API Key (legacy)</h2>
-<div class="warn"><strong>Keep this secret.</strong></div>
-<pre>{api_key}</pre>
-<p><a href="/status">Server status</a></p>
-</body></html>""")
-        except Exception as e:
-            return HTMLResponse(f"<h1>Authentication Failed</h1><p>{e}</p>", status_code=400)
+        # Session not found — server may have restarted and lost /tmp state
+        return HTMLResponse(
+            "<h1>Session Expired</h1>"
+            "<p>The OAuth session was lost (server may have restarted). "
+            "Please start the connection again from claude.ai.</p>",
+            status_code=400,
+        )
 
 
 # ─── Token endpoint ───────────────────────────────────────────────────────────
@@ -579,22 +549,9 @@ async def mcp_get(request: Request):
 
 # ─── Status & Health ──────────────────────────────────────────────────────────
 
-@app.get("/oauth/login", response_class=HTMLResponse)
-async def oauth_login(user_id: str = "default"):
-    """Manual OAuth login (fallback / testing)."""
-    if not os.getenv("GOOGLE_CLIENT_ID") or not os.getenv("GOOGLE_CLIENT_SECRET"):
-        return HTMLResponse("<h1>Config Error</h1><p>GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set.</p>", status_code=500)
-    auth_url, _ = get_authorization_url(user_id)
-    return RedirectResponse(url=auth_url)
-
 
 @app.get("/status", response_class=HTMLResponse)
 async def status():
-    users = list_users()
-    rows = "".join(
-        f"<tr><td><code>{u}</code></td><td>{'✓' if get_credentials(u) else '✗ expired'}</td></tr>"
-        for u in users
-    )
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><title>GA MCP — Status</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:700px;margin:60px auto;padding:0 20px}}
@@ -615,11 +572,8 @@ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding
     <li>Uses Bearer token on <code>POST /mcp</code></li>
   </ol>
 
-  <h2>Legacy Users ({len(users)})</h2>
-  <table><tr><th>User ID</th><th>Google Token</th></tr>
-  {rows or "<tr><td colspan='2'>None</td></tr>"}
-  </table>
-  <p>Manual login: <code>{BASE_URL}/oauth/login?user_id=&lt;name&gt;</code></p>
+  <h2>Active MCP Sessions</h2>
+  <p>Sessions are stored in <code>/tmp/ga_tokens/</code> (ephemeral on Render free tier).</p>
 </body></html>""")
 
 

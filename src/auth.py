@@ -9,6 +9,7 @@ import base64
 import hashlib
 import os
 import secrets
+from datetime import datetime
 from typing import Optional
 
 from google.oauth2.credentials import Credentials
@@ -179,6 +180,14 @@ def credentials_from_token_data(token_data: dict, mcp_token: str, update_fn) -> 
     Build a Credentials object from a stored token dict.
     Auto-refreshes and calls update_fn(updates) if the token was refreshed.
     """
+    raw_expiry = token_data.get("expiry")
+    expiry = None
+    if raw_expiry:
+        try:
+            expiry = datetime.fromisoformat(raw_expiry)
+        except (ValueError, TypeError):
+            pass
+
     creds = Credentials(
         token=token_data.get("token"),
         refresh_token=token_data.get("refresh_token"),
@@ -186,6 +195,7 @@ def credentials_from_token_data(token_data: dict, mcp_token: str, update_fn) -> 
         client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
         client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
         scopes=token_data.get("scopes", SCOPES),
+        expiry=expiry,
     )
 
     if creds.expired and creds.refresh_token:

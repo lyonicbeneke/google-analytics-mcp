@@ -3,6 +3,8 @@ OAuth 2.0 flow for Google Analytics.
 Handles authorization, token refresh, and credential building.
 """
 
+import base64
+import hashlib
 import os
 import secrets
 from typing import Optional
@@ -11,7 +13,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 
-from .storage import load_token, save_token
+from .storage import load_token, save_token, save_pkce, load_pkce, delete_pkce
 
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
@@ -49,11 +51,23 @@ def create_flow(state: Optional[str] = None) -> Flow:
     return flow
 
 
+def _make_pkce() -> tuple[str, str]:
+    """Generate a PKCE code_verifier and its S256 code_challenge."""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return verifier, challenge
+
+
 def get_authorization_url(user_id: str) -> tuple[str, str]:
-    """Returns (authorization_url, state)."""
-    # Generate state first, then embed user_id into it for the callback
+    """Returns (authorization_url, combined_state)."""
     state = secrets.token_urlsafe(16)
     combined_state = f"{state}:{user_id}"
+
+    code_verifier, code_challenge = _make_pkce()
+    save_pkce(combined_state, code_verifier)
+
     flow = create_flow()
     flow.redirect_uri = get_redirect_uri()
     auth_url, _ = flow.authorization_url(
@@ -61,19 +75,26 @@ def get_authorization_url(user_id: str) -> tuple[str, str]:
         include_granted_scopes="true",
         prompt="consent",
         state=combined_state,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
     )
     return auth_url, combined_state
 
 
 def exchange_code(code: str, state: str) -> tuple[Credentials, str]:
     """Exchange auth code for credentials. Returns (credentials, user_id)."""
-    # Extract user_id from state
     parts = state.rsplit(":", 1)
     user_id = parts[1] if len(parts) == 2 else "default"
 
-    flow = create_flow(state=parts[0] if len(parts) == 2 else state)
+    code_verifier = load_pkce(state)
+    delete_pkce(state)
+
+    flow = create_flow()
     flow.redirect_uri = get_redirect_uri()
-    flow.fetch_token(code=code)
+    fetch_kwargs = {"code": code}
+    if code_verifier:
+        fetch_kwargs["code_verifier"] = code_verifier
+    flow.fetch_token(**fetch_kwargs)
 
     creds = flow.credentials
     save_token(user_id, _creds_to_dict(creds))

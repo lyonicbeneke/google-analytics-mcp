@@ -85,3 +85,35 @@ def get_user_by_api_key(api_key: str) -> Optional[str]:
         if key == api_key:
             return user_id
     return None
+
+
+# PKCE code_verifier storage — keyed by OAuth state, lives only during the flow
+def _pkce_file() -> Path:
+    return STORAGE_DIR / "_pkce.json"
+
+
+def save_pkce(state: str, code_verifier: str) -> None:
+    _ensure_dir()
+    data = _load_pkce_store()
+    data[state] = {"verifier": code_verifier, "saved_at": time.time()}
+    _pkce_file().write_text(json.dumps(data))
+
+
+def load_pkce(state: str) -> Optional[str]:
+    return _load_pkce_store().get(state, {}).get("verifier")
+
+
+def delete_pkce(state: str) -> None:
+    data = _load_pkce_store()
+    data.pop(state, None)
+    _pkce_file().write_text(json.dumps(data))
+
+
+def _load_pkce_store() -> dict:
+    f = _pkce_file()
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}

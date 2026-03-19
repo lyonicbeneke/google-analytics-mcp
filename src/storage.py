@@ -1,6 +1,6 @@
 """
-Token storage for multi-user OAuth sessions.
-Stores Google OAuth tokens per user in JSON files.
+Storage for multi-user OAuth sessions and MCP Auth server state.
+All data lives in JSON files under TOKEN_STORAGE_DIR.
 """
 
 import json
@@ -17,8 +17,30 @@ def _ensure_dir() -> None:
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ─── Generic key/value store helpers ─────────────────────────────────────────
+
+def _store_path(name: str) -> Path:
+    return STORAGE_DIR / f"_{name}.json"
+
+
+def _load_store(name: str) -> dict:
+    f = _store_path(name)
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_store(name: str, data: dict) -> None:
+    _ensure_dir()
+    _store_path(name).write_text(json.dumps(data))
+
+
+# ─── Google token storage (legacy / manual login) ────────────────────────────
+
 def _user_file(user_id: str) -> Path:
-    # Sanitize user_id to prevent path traversal
     safe_id = "".join(c for c in user_id if c.isalnum() or c in "-_")
     return STORAGE_DIR / f"{safe_id}.json"
 
@@ -47,73 +69,111 @@ def delete_token(user_id: str) -> None:
 
 def list_users() -> list[str]:
     _ensure_dir()
-    return [p.stem for p in STORAGE_DIR.glob("*.json")]
+    # Exclude internal store files (prefixed with _)
+    return [p.stem for p in STORAGE_DIR.glob("*.json") if not p.stem.startswith("_")]
 
 
-# API key management — each user gets a stable API key after OAuth
-def _keys_file() -> Path:
-    return STORAGE_DIR / "_api_keys.json"
-
-
-def _load_keys() -> dict:
-    f = _keys_file()
-    if not f.exists():
-        return {}
-    try:
-        return json.loads(f.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_keys(keys: dict) -> None:
-    _ensure_dir()
-    _keys_file().write_text(json.dumps(keys))
-
-
-def get_or_create_api_key(user_id: str) -> str:
-    keys = _load_keys()
-    if user_id not in keys:
-        api_key = secrets.token_urlsafe(32)
-        keys[user_id] = api_key
-        _save_keys(keys)
-    return keys[user_id]
-
-
-def get_user_by_api_key(api_key: str) -> Optional[str]:
-    keys = _load_keys()
-    for user_id, key in keys.items():
-        if key == api_key:
-            return user_id
-    return None
-
-
-# PKCE code_verifier storage — keyed by OAuth state, lives only during the flow
-def _pkce_file() -> Path:
-    return STORAGE_DIR / "_pkce.json"
-
+# ─── PKCE storage (Google OAuth, keyed by state) ─────────────────────────────
 
 def save_pkce(state: str, code_verifier: str) -> None:
-    _ensure_dir()
-    data = _load_pkce_store()
-    data[state] = {"verifier": code_verifier, "saved_at": time.time()}
-    _pkce_file().write_text(json.dumps(data))
+    store = _load_store("pkce")
+    store[state] = {"verifier": code_verifier, "saved_at": time.time()}
+    _save_store("pkce", store)
 
 
 def load_pkce(state: str) -> Optional[str]:
-    return _load_pkce_store().get(state, {}).get("verifier")
+    return _load_store("pkce").get(state, {}).get("verifier")
 
 
 def delete_pkce(state: str) -> None:
-    data = _load_pkce_store()
-    data.pop(state, None)
-    _pkce_file().write_text(json.dumps(data))
+    store = _load_store("pkce")
+    store.pop(state, None)
+    _save_store("pkce", store)
 
 
-def _load_pkce_store() -> dict:
-    f = _pkce_file()
-    if not f.exists():
-        return {}
-    try:
-        return json.loads(f.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+# ─── OAuth server: registered clients ────────────────────────────────────────
+
+def save_client(client_id: str, data: dict) -> None:
+    store = _load_store("clients")
+    store[client_id] = data
+    _save_store("clients", store)
+
+
+def load_client(client_id: str) -> Optional[dict]:
+    return _load_store("clients").get(client_id)
+
+
+# ─── OAuth server: in-flight authorization sessions ──────────────────────────
+# Keyed by our internal session_key (used as Google OAuth state).
+# Stores the original client request so we can redirect back after Google auth.
+
+def save_oauth_session(key: str, data: dict) -> None:
+    store = _load_store("oauth_sessions")
+    store[key] = {"data": data, "saved_at": time.time()}
+    _save_store("oauth_sessions", store)
+
+
+def load_oauth_session(key: str) -> Optional[dict]:
+    record = _load_store("oauth_sessions").get(key)
+    return record["data"] if record else None
+
+
+def delete_oauth_session(key: str) -> None:
+    store = _load_store("oauth_sessions")
+    store.pop(key, None)
+    _save_store("oauth_sessions", store)
+
+
+# ─── OAuth server: authorization codes (short-lived, single-use) ─────────────
+
+def save_auth_code(code: str, data: dict) -> None:
+    store = _load_store("auth_codes")
+    store[code] = {"data": data, "saved_at": time.time()}
+    _save_store("auth_codes", store)
+
+
+def load_auth_code(code: str) -> Optional[dict]:
+    record = _load_store("auth_codes").get(code)
+    if not record:
+        return None
+    # Auth codes expire after 10 minutes
+    if time.time() - record["saved_at"] > 600:
+        delete_auth_code(code)
+        return None
+    return record["data"]
+
+
+def delete_auth_code(code: str) -> None:
+    store = _load_store("auth_codes")
+    store.pop(code, None)
+    _save_store("auth_codes", store)
+
+
+# ─── OAuth server: access tokens ─────────────────────────────────────────────
+
+def save_access_token(token: str, data: dict) -> None:
+    store = _load_store("access_tokens")
+    store[token] = data
+    _save_store("access_tokens", store)
+
+
+def load_access_token(token: str) -> Optional[dict]:
+    return _load_store("access_tokens").get(token)
+
+
+def update_access_token(token: str, updates: dict) -> None:
+    """Patch fields in an existing access token record (e.g. after Google token refresh)."""
+    store = _load_store("access_tokens")
+    if token in store:
+        store[token].update(updates)
+        _save_store("access_tokens", store)
+
+
+# ─── Legacy API keys (manual login) ──────────────────────────────────────────
+
+def get_or_create_api_key(user_id: str) -> str:
+    keys = _load_store("api_keys")
+    if user_id not in keys:
+        keys[user_id] = secrets.token_urlsafe(32)
+        _save_store("api_keys", keys)
+    return keys[user_id]

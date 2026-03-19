@@ -3,7 +3,7 @@ services:
     name: google-analytics-mcp
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     plan: free  # upgrade to starter for persistent disk
     envVars:
       - key: GOOGLE_CLIENT_ID

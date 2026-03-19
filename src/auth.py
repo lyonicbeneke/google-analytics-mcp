@@ -23,6 +23,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
 ]
 
+
 CLIENT_CONFIG = {
     "web": {
         "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
@@ -72,7 +73,6 @@ def get_authorization_url(user_id: str) -> tuple[str, str]:
     flow.redirect_uri = get_redirect_uri()
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         prompt="consent",
         state=combined_state,
         code_challenge=code_challenge,

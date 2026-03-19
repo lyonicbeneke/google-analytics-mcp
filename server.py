@@ -507,9 +507,9 @@ async def mcp_post(request: Request):
 
     headers = {"mcp-session-id": session_id}
 
-    # initialize and ping don't need credentials
+    # tools/list is metadata — no credentials needed (actual tool calls do require auth)
     def _needs_creds(msg: dict) -> bool:
-        return msg.get("method") not in ("initialize", "ping", "notifications/initialized", None)
+        return msg.get("method") not in ("initialize", "ping", "notifications/initialized", "tools/list", None)
 
     if isinstance(body, list):
         if any(_needs_creds(m) for m in body) and not creds:

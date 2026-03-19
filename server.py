@@ -308,18 +308,21 @@ async def oauth_register(request: Request):
     client_secret = secrets.token_urlsafe(32)
     issued_at = int(time.time())
 
+    auth_method = body.get("token_endpoint_auth_method", "client_secret_post")
     client_data = {
         "client_id": client_id,
-        "client_secret": client_secret,
         "client_id_issued_at": issued_at,
         "redirect_uris": redirect_uris,
         "client_name": body.get("client_name", "MCP Client"),
         "grant_types": body.get("grant_types", ["authorization_code"]),
         "response_types": body.get("response_types", ["code"]),
-        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_post"),
+        "token_endpoint_auth_method": auth_method,
     }
-    save_client(client_id, client_data)
+    # Only include client_secret for confidential clients
+    if auth_method != "none":
+        client_data["client_secret"] = client_secret
 
+    save_client(client_id, client_data)
     return JSONResponse(client_data, status_code=201)
 
 
@@ -336,16 +339,16 @@ async def oauth_authorize(
     code_challenge_method: str = "S256",
     scope: Optional[str] = None,
 ):
-    # Validate client
-    if client_id:
-        client = load_client(client_id)
-        if not client:
-            return JSONResponse({"error": "invalid_client"}, status_code=400)
-        if redirect_uri and redirect_uri not in client["redirect_uris"]:
-            return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri mismatch"}, status_code=400)
-
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
+
+    # Validate redirect_uri against registered client if client is found in storage.
+    # We don't hard-fail if client_id is unknown (e.g. after server restart cleared /tmp)
+    # because MCP clients re-register on every connection anyway.
+    if client_id and redirect_uri:
+        client = load_client(client_id)
+        if client and redirect_uri not in client["redirect_uris"]:
+            return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri mismatch"}, status_code=400)
 
     # Store the client's authorization request so we can resume after Google OAuth
     session_key = secrets.token_urlsafe(24)
@@ -394,18 +397,27 @@ async def oauth_callback(request: Request, code: Optional[str] = None, state: Op
         client_state = session.get("client_state")
 
         if redirect_uri:
-            params = {"code": auth_code}
+            params: dict = {"code": auth_code}
             if client_state:
                 params["state"] = client_state
             return RedirectResponse(url=f"{redirect_uri}?{urlencode(params)}")
 
-        # No redirect_uri — show the code (shouldn't happen in normal flow)
+        # No redirect_uri — show the code (only happens in manual/test flows)
         return HTMLResponse(f"<h1>Authorized</h1><p>Code: <code>{auth_code}</code></p>")
 
     else:
-        # ── Legacy manual flow: user_id encoded in state ──
+        # ── Legacy manual flow OR session lost (server restart) ──
+        # If the state looks like it came from a registered client (no ":" separator),
+        # redirect to a known error page rather than attempting a wrong exchange.
+        if state and ":" not in state and redirect_uri is None:
+            return HTMLResponse(
+                "<h1>Session Expired</h1>"
+                "<p>The OAuth session was lost (server may have restarted). "
+                "Please start the connection again from claude.ai.</p>",
+                status_code=400,
+            )
         try:
-            creds, user_id = exchange_code(code=code, state=state)
+            creds, user_id = exchange_code(code=code, state=state or "")
             from src.storage import get_or_create_api_key
             api_key = get_or_create_api_key(user_id)
             return HTMLResponse(f"""<!DOCTYPE html>
@@ -490,7 +502,7 @@ async def oauth_token(request: Request):
 
     return JSONResponse({
         "access_token": access_token,
-        "token_type": "bearer",
+        "token_type": "Bearer",
         "expires_in": expires_in,
         "scope": "analytics",
     })

@@ -1,12 +1,12 @@
 """
 Google Analytics 4 MCP Server — MCP Auth Spec 2025-03-26
 
-OAuth 2.0 Authorization Server endpoints:
+OAuth 2.0 Authorization Server endpoints (spec-compliant paths, no /oauth/ prefix):
   GET  /.well-known/oauth-authorization-server  — RFC 8414 metadata
-  POST /oauth/register                           — RFC 7591 Dynamic Client Registration
-  GET  /oauth/authorize                          — authorization endpoint (proxies to Google)
-  GET  /oauth/callback                           — Google OAuth callback (internal)
-  POST /oauth/token                              — token endpoint
+  POST /register                                — RFC 7591 Dynamic Client Registration
+  GET  /authorize                               — authorization endpoint (proxies to Google)
+  GET  /oauth/callback                          — Google OAuth callback (internal)
+  POST /token                                   — token endpoint
 
 MCP Streamable HTTP:
   POST /mcp   — JSON-RPC dispatcher (requires Bearer token)
@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from src.auth import (
@@ -250,16 +251,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Mcp-Session-Id", "MCP-Protocol-Version"],
+    expose_headers=["Mcp-Session-Id"],
+)
+
 
 # ─── OAuth 2.0 Authorization Server Metadata (RFC 8414) ──────────────────────
 
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_authorization_server_metadata():
+    # Paths MUST match the MCP spec default fallbacks: /authorize, /token, /register
     return JSONResponse({
         "issuer": BASE_URL,
-        "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
-        "token_endpoint": f"{BASE_URL}/oauth/token",
-        "registration_endpoint": f"{BASE_URL}/oauth/register",
+        "authorization_endpoint": f"{BASE_URL}/authorize",
+        "token_endpoint": f"{BASE_URL}/token",
+        "registration_endpoint": f"{BASE_URL}/register",
         "scopes_supported": ["analytics"],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
@@ -277,12 +287,13 @@ async def oauth_protected_resource_metadata():
         "authorization_servers": [BASE_URL],
         "scopes_supported": ["analytics"],
         "bearer_methods_supported": ["header"],
+        "resource_name": "Google Analytics MCP Server",
     })
 
 
 # ─── Dynamic Client Registration (RFC 7591) ───────────────────────────────────
 
-@app.post("/oauth/register")
+@app.post("/register")
 async def oauth_register(request: Request):
     try:
         body = await request.json()
@@ -314,7 +325,7 @@ async def oauth_register(request: Request):
 
 # ─── Authorization endpoint ───────────────────────────────────────────────────
 
-@app.get("/oauth/authorize")
+@app.get("/authorize")
 async def oauth_authorize(
     request: Request,
     response_type: str = "code",
@@ -418,7 +429,7 @@ pre{{background:#1e1e1e;color:#d4d4d4;padding:20px;border-radius:8px;overflow-x:
 
 # ─── Token endpoint ───────────────────────────────────────────────────────────
 
-@app.post("/oauth/token")
+@app.post("/token")
 async def oauth_token(request: Request):
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -586,9 +597,9 @@ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding
   <h2>OAuth Flow (claude.ai)</h2>
   <ol>
     <li>claude.ai fetches <code>/.well-known/oauth-authorization-server</code></li>
-    <li>Registers via <code>POST /oauth/register</code></li>
-    <li>Redirects user to <code>/oauth/authorize</code> → Google OAuth</li>
-    <li>Exchanges code at <code>POST /oauth/token</code> for Bearer token</li>
+    <li>Registers via <code>POST /register</code></li>
+    <li>Redirects user to <code>/authorize</code> → Google OAuth</li>
+    <li>Exchanges code at <code>POST /token</code> for Bearer token</li>
     <li>Uses Bearer token on <code>POST /mcp</code></li>
   </ol>
 

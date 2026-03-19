@@ -4,6 +4,7 @@ Handles authorization, token refresh, and credential building.
 """
 
 import os
+import secrets
 from typing import Optional
 
 from google.oauth2.credentials import Credentials
@@ -50,16 +51,18 @@ def create_flow(state: Optional[str] = None) -> Flow:
 
 def get_authorization_url(user_id: str) -> tuple[str, str]:
     """Returns (authorization_url, state)."""
+    # Generate state first, then embed user_id into it for the callback
+    state = secrets.token_urlsafe(16)
+    combined_state = f"{state}:{user_id}"
     flow = create_flow()
     flow.redirect_uri = get_redirect_uri()
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
-        # Encode user_id into state so callback knows who authenticated
-        state=f"{state}:{user_id}",
+        state=combined_state,
     )
-    return auth_url, state
+    return auth_url, combined_state
 
 
 def exchange_code(code: str, state: str) -> tuple[Credentials, str]:

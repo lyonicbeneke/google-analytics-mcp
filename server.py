@@ -43,7 +43,8 @@ from src.storage import (
     save_client, load_client,
     save_oauth_session, load_oauth_session, delete_oauth_session,
     save_auth_code, load_auth_code, delete_auth_code,
-    save_access_token, load_access_token, update_access_token,
+    save_access_token, load_access_token,
+    save_token, load_token,
 )
 import src.ga_tools as ga
 
@@ -337,14 +338,13 @@ async def oauth_authorize(
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
     # Validate redirect_uri against registered client if client is found in storage.
-    # We don't hard-fail if client_id is unknown (e.g. after server restart cleared /tmp)
-    # because MCP clients re-register on every connection anyway.
     if client_id and redirect_uri:
         client = load_client(client_id)
         if client and redirect_uri not in client["redirect_uris"]:
             return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri mismatch"}, status_code=400)
 
-    # Store the client's authorization request so we can resume after Google OAuth
+    # Stable user_id ties this MCP session to GA4 credentials
+    user_id = secrets.token_urlsafe(16)
     session_key = secrets.token_urlsafe(24)
     save_oauth_session(session_key, {
         "client_id": client_id,
@@ -352,61 +352,118 @@ async def oauth_authorize(
         "client_state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "user_id": user_id,
     })
 
-    # Redirect to Google OAuth, using session_key as the state
-    return RedirectResponse(url=google_auth_url(session_key))
+    # Show consent page — user must connect their GA4 account before proceeding
+    ga_auth_url = f"{BASE_URL}/auth/google?user_id={user_id}&session_key={session_key}"
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><title>Connect Google Analytics</title>
+<style>
+  body{{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 24px;text-align:center}}
+  h1{{font-size:1.5em;margin-bottom:8px}}
+  p{{color:#555;line-height:1.6}}
+  .btn{{display:inline-block;background:#4285f4;color:#fff;padding:14px 36px;border-radius:8px;
+        text-decoration:none;font-size:1em;font-weight:600;margin-top:28px}}
+  .btn:hover{{background:#3367d6}}
+  .note{{margin-top:24px;font-size:.85em;color:#888}}
+</style></head>
+<body>
+  <div style="font-size:2.5em;margin-bottom:12px">📊</div>
+  <h1>Google Analytics MCP</h1>
+  <p>To use Google Analytics tools in Claude,<br>connect your Google Analytics account.</p>
+  <a class="btn" href="{ga_auth_url}">Connect Google Analytics</a>
+  <p class="note">You will be redirected to Google to grant read/write access<br>to your Analytics properties.</p>
+</body></html>""")
+
+
+# ─── GA4 OAuth (user-facing, separate from MCP auth) ─────────────────────────
+
+@app.get("/auth/google")
+async def auth_google(user_id: str, session_key: Optional[str] = None):
+    """
+    Start Google OAuth for a specific user_id.
+    - Initial flow: called from the /authorize consent page with session_key
+    - Reconnect flow: called from a tool error link with just user_id
+    State passed to Google = "session_key:user_id" (initial) or "user_id" (reconnect).
+    """
+    if not user_id:
+        return HTMLResponse("<h1>Bad Request</h1><p>user_id required.</p>", status_code=400)
+
+    # Encode both pieces into the Google OAuth state so the callback can recover them
+    google_state = f"{session_key}:{user_id}" if session_key else user_id
+    return RedirectResponse(url=google_auth_url(google_state))
 
 
 # ─── Google OAuth callback ────────────────────────────────────────────────────
 
 @app.get("/oauth/callback")
-async def oauth_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+async def oauth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
     if error:
         return HTMLResponse(f"<h1>Google OAuth Error</h1><p>{error}</p>", status_code=400)
-
     if not code or not state:
         return HTMLResponse("<h1>Bad Request</h1><p>Missing code or state.</p>", status_code=400)
 
-    session = load_oauth_session(state) if state else None
+    # Exchange Google auth code for GA4 tokens
+    try:
+        google_tokens = google_exchange_code(code, state)
+    except Exception as e:
+        return HTMLResponse(f"<h1>Token Exchange Failed</h1><p>{e}</p>", status_code=400)
 
-    if session:
-        # ── MCP Auth flow: client registered, redirect back with auth code ──
-        delete_oauth_session(state)
-        try:
-            google_tokens = google_exchange_code(code, state)
-        except Exception as e:
-            return HTMLResponse(f"<h1>Token Exchange Failed</h1><p>{e}</p>", status_code=400)
+    if ":" in state:
+        # ── Initial flow: state = "session_key:user_id" ──
+        session_key, user_id = state.split(":", 1)
+        session = load_oauth_session(session_key)
+        if not session:
+            return HTMLResponse(
+                "<h1>Session Expired</h1>"
+                "<p>The session was lost (server may have restarted). "
+                "Please start the connection again from claude.ai.</p>",
+                status_code=400,
+            )
+        delete_oauth_session(session_key)
 
+        # Persist GA4 token for this user
+        save_token(user_id, google_tokens)
+
+        # Issue MCP auth code carrying user_id (not google_tokens)
         auth_code = secrets.token_urlsafe(32)
         save_auth_code(auth_code, {
             "client_id": session.get("client_id"),
             "redirect_uri": session.get("redirect_uri"),
             "code_challenge": session.get("code_challenge"),
             "code_challenge_method": session.get("code_challenge_method", "S256"),
-            "google_tokens": google_tokens,
+            "user_id": user_id,
         })
 
         redirect_uri = session.get("redirect_uri")
         client_state = session.get("client_state")
-
         if redirect_uri:
             params: dict = {"code": auth_code}
             if client_state:
                 params["state"] = client_state
             return RedirectResponse(url=f"{redirect_uri}?{urlencode(params)}")
-
-        # No redirect_uri — show the code (only happens in manual/test flows)
         return HTMLResponse(f"<h1>Authorized</h1><p>Code: <code>{auth_code}</code></p>")
 
     else:
-        # Session not found — server may have restarted and lost /tmp state
-        return HTMLResponse(
-            "<h1>Session Expired</h1>"
-            "<p>The OAuth session was lost (server may have restarted). "
-            "Please start the connection again from claude.ai.</p>",
-            status_code=400,
-        )
+        # ── Reconnect flow: state = "user_id" ──
+        user_id = state
+        save_token(user_id, google_tokens)
+        return HTMLResponse("""<!DOCTYPE html>
+<html><head><title>GA4 Connected</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 24px;text-align:center}
+.ok{color:#16a34a;font-size:2em}</style></head>
+<body>
+  <div class="ok">✓</div>
+  <h1>Google Analytics Connected</h1>
+  <p>Your GA4 account has been linked. You can now use Google Analytics tools in Claude.</p>
+  <p style="color:#888;font-size:.9em">You may close this tab.</p>
+</body></html>""")
 
 
 # ─── Token endpoint ───────────────────────────────────────────────────────────
@@ -458,13 +515,13 @@ async def oauth_token(request: Request):
         if computed != stored_challenge:
             return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, status_code=400)
 
-    # Issue our access token
+    # Issue our access token (stores user_id, not google_tokens — GA4 token lives separately)
     access_token = secrets.token_urlsafe(40)
     expires_in = 86400 * 30  # 30 days
 
     save_access_token(access_token, {
         "client_id": code_data.get("client_id"),
-        "google_tokens": code_data["google_tokens"],
+        "user_id": code_data["user_id"],
         "issued_at": time.time(),
         "expires_at": time.time() + expires_in,
     })
@@ -485,17 +542,26 @@ async def mcp_post(request: Request):
     session_id = request.headers.get("mcp-session-id", str(uuid.uuid4()))
     bearer = _resolve_bearer(request)
 
-    # Resolve credentials from Bearer token
+    # Two-layer auth:
+    #   mcp_authed  = bearer token is known to our server (MCP-level auth)
+    #   creds       = Google Analytics credentials (GA4-level auth)
+    mcp_authed = False
+    user_id = None
     creds = None
+
     if bearer:
         token_data = load_access_token(bearer)
         if token_data:
-            google_tokens = token_data.get("google_tokens", {})
-            creds = credentials_from_token_data(
-                google_tokens,
-                bearer,
-                lambda updates: update_access_token(bearer, {"google_tokens": updates}),
-            )
+            mcp_authed = True
+            user_id = token_data.get("user_id")
+            if user_id:
+                ga4_token_data = load_token(user_id)
+                if ga4_token_data:
+                    creds = credentials_from_token_data(
+                        ga4_token_data,
+                        bearer,
+                        lambda updates: save_token(user_id, updates),
+                    )
 
     try:
         body = await request.json()
@@ -507,20 +573,57 @@ async def mcp_post(request: Request):
 
     headers = {"mcp-session-id": session_id}
 
-    # tools/list is metadata — no credentials needed (actual tool calls do require auth)
-    def _needs_creds(msg: dict) -> bool:
-        return msg.get("method") not in ("initialize", "ping", "notifications/initialized", "tools/list", None)
+    # Methods that don't need any auth
+    NO_AUTH = ("initialize", "ping", "notifications/initialized", "tools/list", None)
+
+    def _needs_mcp_auth(msg: dict) -> bool:
+        return msg.get("method") not in NO_AUTH
+
+    def _is_tool_call(msg: dict) -> bool:
+        return msg.get("method") == "tools/call"
+
+    def _ga4_missing_error(msg: dict) -> dict:
+        """Return a tools/call result telling the user to connect GA4."""
+        auth_link = f"{BASE_URL}/auth/google?user_id={user_id}" if user_id else f"{BASE_URL}/status"
+        return {
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "⚠️ Google Analytics is not connected yet.\n\n"
+                        "Please authorize your GA4 account by opening this link:\n\n"
+                        f"{auth_link}\n\n"
+                        "After connecting, try again."
+                    ),
+                }],
+                "isError": True,
+            },
+        }
 
     if isinstance(body, list):
-        if any(_needs_creds(m) for m in body) and not creds:
+        # 401 only if MCP token is missing for methods that need it
+        if any(_needs_mcp_auth(m) for m in body) and not mcp_authed:
             return _unauthorized_response(session_id)
-        responses = [r for r in [await _handle_jsonrpc(m, creds, session_id) for m in body] if r is not None]
+        responses = []
+        for m in body:
+            if _is_tool_call(m) and not creds:
+                responses.append(_ga4_missing_error(m))
+            else:
+                r = await _handle_jsonrpc(m, creds, session_id)
+                if r is not None:
+                    responses.append(r)
         if not responses:
             return Response(status_code=202, headers=headers)
         return JSONResponse(content=responses, headers=headers)
 
-    if _needs_creds(body) and not creds:
+    # Single message
+    if _needs_mcp_auth(body) and not mcp_authed:
         return _unauthorized_response(session_id)
+
+    if _is_tool_call(body) and not creds:
+        return JSONResponse(content=_ga4_missing_error(body), headers=headers)
 
     response = await _handle_jsonrpc(body, creds, session_id)
     if response is None:

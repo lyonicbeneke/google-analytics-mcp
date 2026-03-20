@@ -17,4 +17,4 @@ services:
       - key: TOKEN_STORAGE_DIR
         value: /tmp/ga_tokens
       - key: PYTHON_VERSION
-        value: "3.11.0"
+        value: "3.12.0"

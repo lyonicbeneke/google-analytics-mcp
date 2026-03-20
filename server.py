@@ -26,9 +26,8 @@ import os
 
 from dotenv import load_dotenv
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
@@ -56,9 +55,10 @@ provider = GoogleOAuthProvider()
 
 # ─── MCP Server ──────────────────────────────────────────────────────────────
 
-mcp = MCPServer(
-    name="Google Analytics MCP",
+mcp = FastMCP(
+    "Google Analytics MCP",
     auth_server_provider=provider,
+    stateless_http=True,
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(BASE_URL),
         client_registration_options=ClientRegistrationOptions(
@@ -217,16 +217,13 @@ async def health(request: Request):
 
 
 # ─── Build the combined Starlette app ────────────────────────────────────────
-# MCPServer.streamable_http_app() builds routes for /mcp, /authorize, /token,
-# /register, /.well-known/*, etc.  We extract those routes and merge with our
-# custom routes in a single flat Starlette app — no path-stripping Mount needed.
+# FastMCP.streamable_http_app() returns a Starlette app with /mcp, /authorize,
+# /token, /register, /.well-known/* already set up and the session manager's
+# lifespan attached.  We insert our custom routes at the front of the router's
+# routes list (before the first request) so they take precedence — this
+# preserves lifespan, middleware, and all existing routes intact.
 
-_mcp_app = mcp.streamable_http_app(stateless_http=True)
+app = mcp.streamable_http_app()
 
-app = Starlette(
-    routes=[
-        Route("/oauth/callback", endpoint=oauth_callback, methods=["GET"]),
-        Route("/health", endpoint=health, methods=["GET"]),
-        *_mcp_app.router.routes,
-    ],
-)
+app.router.routes.insert(0, Route("/oauth/callback", endpoint=oauth_callback, methods=["GET"]))
+app.router.routes.insert(1, Route("/health", endpoint=health, methods=["GET"]))

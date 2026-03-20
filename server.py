@@ -1,20 +1,13 @@
 """
-Google Analytics MCP Server — Official Python MCP SDK with OAuth 2.1.
-
-Architecture:
-  - Single Render service that is both AS (OAuth Authorization Server) and
-    RS (MCP Resource Server) using the official Python MCP SDK.
-  - All state is stateless: PKCE in encrypted Google state, GA4 refresh_token
-    embedded in Fernet-encrypted MCP bearer token.  Zero /tmp dependency.
-  - Tools cover GA4 Data API (read+write) and Admin API.
+Google Analytics MCP Server - Official Python MCP SDK with OAuth 2.1.
 
 OAuth flow:
-  1.  claude.ai → GET /authorize
-  2.  → redirect to Google OAuth (PKCE + all state in encrypted URL param)
-  3.  Google → GET /oauth/callback
-  4.  → decrypt state, exchange code, issue MCP auth code, redirect to claude.ai
-  5.  claude.ai → POST /token → self-contained Fernet-encrypted bearer token
-  6.  claude.ai → POST /mcp (Bearer token) → GA4 calls via embedded refresh_token
+  1.  claude.ai -> GET /authorize
+  2.  -> redirect to Google OAuth (PKCE + all state in encrypted URL param)
+  3.  Google -> GET /oauth/callback
+  4.  -> decrypt state, exchange code, issue MCP auth code, redirect to claude.ai
+  5.  claude.ai -> POST /token -> self-contained Fernet-encrypted bearer token
+  6.  claude.ai -> POST /mcp (Bearer token) -> GA4 calls via embedded refresh_token
 
 Render env vars required:
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BASE_URL, SECRET_KEY (auto-generated)
@@ -23,6 +16,7 @@ Render env vars required:
 import json
 import logging
 import os
+import traceback
 
 from dotenv import load_dotenv
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -49,11 +43,11 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
-# ─── Auth provider ────────────────────────────────────────────────────────────
+# --- Auth provider -----------------------------------------------------------
 
 provider = GoogleOAuthProvider()
 
-# ─── MCP Server ──────────────────────────────────────────────────────────────
+# --- MCP Server --------------------------------------------------------------
 
 mcp = FastMCP(
     "Google Analytics MCP",
@@ -73,42 +67,65 @@ mcp = FastMCP(
 )
 
 
-# ─── Tools ───────────────────────────────────────────────────────────────────
+# --- Credential helper -------------------------------------------------------
 
 def _creds():
-    """Get the current request's GA4 credentials (set by load_access_token)."""
     creds = current_ga_creds.get()
+    logger.info("[GA] _creds() called — creds present: %s", creds is not None)
+    if creds:
+        logger.info(
+            "[GA] creds.valid=%s  creds.expired=%s  has_refresh_token=%s  token_present=%s",
+            getattr(creds, "valid", "?"),
+            getattr(creds, "expired", "?"),
+            bool(getattr(creds, "refresh_token", None)),
+            bool(getattr(creds, "token", None)),
+        )
     if not creds:
-        raise RuntimeError(
+        msg = (
             "Google Analytics credentials not available. "
             "Please re-authorize: disconnect and reconnect the Google Analytics "
             "connector in claude.ai to trigger a new OAuth flow."
         )
+        logger.error("[GA] _creds() — no credentials in context: %s", msg)
+        raise RuntimeError(msg)
     return creds
 
 
+async def _call(tool_name, coro):
+    """Await coro, log full traceback on error."""
+    try:
+        return await coro
+    except Exception as exc:
+        logger.error(
+            "[GA] TOOL ERROR [%s]: %s\nTraceback:\n%s",
+            tool_name, exc, traceback.format_exc(),
+        )
+        raise
+
+
+# --- Tools -------------------------------------------------------------------
+
 @mcp.tool(description="Retrieve all GA4 accounts and properties the authenticated user can access.")
 async def ga_get_account_summaries() -> str:
-    result = await get_account_summaries(_creds())
+    result = await _call("ga_get_account_summaries", get_account_summaries(_creds()))
     return json.dumps(result, indent=2)
 
 
 @mcp.tool(description="Get full details for a specific GA4 property.")
 async def ga_get_property_details(property_id: str) -> str:
-    """Args: property_id — numeric ID or 'properties/NNN'."""
-    result = await get_property_details(_creds(), property_id)
+    result = await _call("ga_get_property_details", get_property_details(_creds(), property_id))
     return json.dumps(result, indent=2)
 
 
 @mcp.tool(description="List Google Ads account links for a GA4 property.")
 async def ga_list_google_ads_links(property_id: str) -> str:
-    result = await list_google_ads_links(_creds(), property_id)
+    result = await _call("ga_list_google_ads_links", list_google_ads_links(_creds(), property_id))
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(description="Return date annotations for a GA4 property (release notes, campaign launches, etc.).")
+@mcp.tool(description="Return date annotations for a GA4 property.")
 async def ga_list_property_annotations(property_id: str) -> str:
-    result = await list_property_annotations(_creds(), property_id)
+    result = await _call("ga_list_property_annotations", list_property_annotations(_creds(), property_id))
     return json.dumps(result, indent=2)
 
 
@@ -133,20 +150,13 @@ async def ga_run_report(
     currency_code: str | None = None,
     return_property_quota: bool = False,
 ) -> str:
-    result = await run_report(
-        _creds(),
-        property_id,
-        date_ranges=date_ranges,
-        dimensions=dimensions,
-        metrics=metrics,
-        dimension_filter=dimension_filter,
-        metric_filter=metric_filter,
-        order_bys=order_bys,
-        limit=limit,
-        offset=offset,
-        currency_code=currency_code,
-        return_property_quota=return_property_quota,
-    )
+    result = await _call("ga_run_report", run_report(
+        _creds(), property_id,
+        date_ranges=date_ranges, dimensions=dimensions, metrics=metrics,
+        dimension_filter=dimension_filter, metric_filter=metric_filter,
+        order_bys=order_bys, limit=limit, offset=offset,
+        currency_code=currency_code, return_property_quota=return_property_quota,
+    ))
     return json.dumps(result, indent=2)
 
 
@@ -162,38 +172,32 @@ async def ga_run_realtime_report(
     offset: int | None = None,
     return_property_quota: bool = False,
 ) -> str:
-    result = await run_realtime_report(
-        _creds(),
-        property_id,
-        dimensions=dimensions,
-        metrics=metrics,
-        dimension_filter=dimension_filter,
-        metric_filter=metric_filter,
-        order_bys=order_bys,
-        limit=limit,
-        offset=offset,
+    result = await _call("ga_run_realtime_report", run_realtime_report(
+        _creds(), property_id,
+        dimensions=dimensions, metrics=metrics,
+        dimension_filter=dimension_filter, metric_filter=metric_filter,
+        order_bys=order_bys, limit=limit, offset=offset,
         return_property_quota=return_property_quota,
-    )
+    ))
     return json.dumps(result, indent=2)
 
 
 @mcp.tool(description="Return custom dimensions and metrics defined for a GA4 property.")
 async def ga_get_custom_dimensions_and_metrics(property_id: str) -> str:
-    result = await get_custom_dimensions_and_metrics(_creds(), property_id)
+    result = await _call(
+        "ga_get_custom_dimensions_and_metrics",
+        get_custom_dimensions_and_metrics(_creds(), property_id),
+    )
     return json.dumps(result, indent=2)
 
 
-# ─── Google OAuth callback route ─────────────────────────────────────────────
+# --- Google OAuth callback ---------------------------------------------------
 
 async def oauth_callback(request: Request):
-    """Handle Google's redirect after user grants (or denies) consent."""
     error = request.query_params.get("error")
     if error:
         desc = request.query_params.get("error_description", error)
-        return HTMLResponse(
-            f"<h2>Authorization failed</h2><p>{desc}</p>",
-            status_code=400,
-        )
+        return HTMLResponse(f"<h2>Authorization failed</h2><p>{desc}</p>", status_code=400)
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
@@ -204,10 +208,7 @@ async def oauth_callback(request: Request):
         redirect_url = await provider.handle_google_callback(code, state)
     except Exception as exc:
         logger.exception("Google callback error")
-        return HTMLResponse(
-            f"<h2>OAuth error</h2><pre>{exc}</pre>",
-            status_code=500,
-        )
+        return HTMLResponse(f"<h2>OAuth error</h2><pre>{exc}</pre>", status_code=500)
 
     return RedirectResponse(url=redirect_url, status_code=302)
 
@@ -216,12 +217,7 @@ async def health(request: Request):
     return JSONResponse({"status": "ok", "server": "google-analytics-mcp"})
 
 
-# ─── Build the combined Starlette app ────────────────────────────────────────
-# FastMCP.streamable_http_app() returns a Starlette app with /mcp, /authorize,
-# /token, /register, /.well-known/* already set up and the session manager's
-# lifespan attached.  We insert our custom routes at the front of the router's
-# routes list (before the first request) so they take precedence — this
-# preserves lifespan, middleware, and all existing routes intact.
+# --- Build Starlette app -----------------------------------------------------
 
 app = mcp.streamable_http_app()
 

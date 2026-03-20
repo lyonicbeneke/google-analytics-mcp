@@ -4,28 +4,17 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
-    plan: free  # upgrade to starter for persistent disk
+    plan: free
     envVars:
       - key: GOOGLE_CLIENT_ID
-        sync: false  # set in Render dashboard
+        sync: false
       - key: GOOGLE_CLIENT_SECRET
-        sync: false  # set in Render dashboard
+        sync: false
       - key: SECRET_KEY
-        generateValue: true  # Render generates a random value
+        generateValue: true
       - key: BASE_URL
-        sync: false  # set to your Render URL: https://your-app.onrender.com
+        value: https://google-analytics-mcp-u8cy.onrender.com
       - key: TOKEN_STORAGE_DIR
         value: /tmp/ga_tokens
       - key: PYTHON_VERSION
         value: "3.11.0"
-
-    # NOTE: /tmp is ephemeral on Render free tier.
-    # For persistent token storage across restarts, either:
-    #   1. Add a Render Disk (paid) and set TOKEN_STORAGE_DIR to the mount path
-    #   2. Use a Redis/Postgres addon and modify storage.py accordingly
-    #
-    # Disk example (uncomment and adjust plan):
-    # disk:
-    #   name: ga-tokens
-    #   mountPath: /data/ga_tokens
-    #   sizeGB: 1

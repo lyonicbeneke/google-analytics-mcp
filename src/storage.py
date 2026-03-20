@@ -1,8 +1,13 @@
 """
-Persistent JSON storage under TOKEN_STORAGE_DIR (defaults to /tmp/ga_tokens).
-Covers: registered MCP clients, MCP auth codes, MCP access tokens, GA4 user tokens.
-PKCE is no longer stored here — the code_verifier lives inside the encrypted
-OAuth state parameter so it survives server restarts.
+Minimal persistent storage under TOKEN_STORAGE_DIR (defaults to /tmp/ga_tokens).
+
+Stores:
+  - Registered MCP clients (Dynamic Client Registration) — keyed by client_id
+  - MCP authorization codes (short-lived, 10-min TTL) — keyed by code
+  - GA4 user access tokens cache (keyed by user_id, for fast credential refresh)
+
+PKCE and MCP access tokens are NOT stored here — they live in encrypted URL
+state / Fernet-encrypted bearer tokens and survive Render restarts.
 """
 
 import json
@@ -37,30 +42,7 @@ def _save_store(name: str, data: dict) -> None:
     _store_path(name).write_text(json.dumps(data))
 
 
-# ─── GA4 user tokens (keyed by user_id) ──────────────────────────────────────
-
-def _user_file(user_id: str) -> Path:
-    safe_id = "".join(c for c in user_id if c.isalnum() or c in "-_")
-    return STORAGE_DIR / f"{safe_id}.json"
-
-
-def save_token(user_id: str, token_data: dict) -> None:
-    _ensure_dir()
-    token_data["saved_at"] = time.time()
-    _user_file(user_id).write_text(json.dumps(token_data))
-
-
-def load_token(user_id: str) -> Optional[dict]:
-    path = _user_file(user_id)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-# ─── Registered MCP clients (Dynamic Client Registration) ────────────────────
+# ─── Registered MCP clients ──────────────────────────────────────────────────
 
 def save_client(client_id: str, data: dict) -> None:
     store = _load_store("clients")
@@ -96,13 +78,24 @@ def delete_auth_code(code: str) -> None:
     _save_store("auth_codes", store)
 
 
-# ─── MCP access tokens ────────────────────────────────────────────────────────
+# ─── GA4 user token cache (keyed by user_id) ─────────────────────────────────
 
-def save_access_token(token: str, data: dict) -> None:
-    store = _load_store("access_tokens")
-    store[token] = data
-    _save_store("access_tokens", store)
+def _user_file(user_id: str) -> Path:
+    safe_id = "".join(c for c in user_id if c.isalnum() or c in "-_")
+    return STORAGE_DIR / f"{safe_id}.json"
 
 
-def load_access_token(token: str) -> Optional[dict]:
-    return _load_store("access_tokens").get(token)
+def save_token(user_id: str, token_data: dict) -> None:
+    _ensure_dir()
+    token_data["saved_at"] = time.time()
+    _user_file(user_id).write_text(json.dumps(token_data))
+
+
+def load_token(user_id: str) -> Optional[dict]:
+    path = _user_file(user_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None

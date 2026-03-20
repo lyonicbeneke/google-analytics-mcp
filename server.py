@@ -1,16 +1,21 @@
 """
-Google Analytics 4 MCP Server — MCP Auth Spec 2025-03-26
+Google Analytics MCP Server — rebuilt on official google-analytics-mcp tooling.
 
-OAuth 2.0 Authorization Server endpoints (spec-compliant paths, no /oauth/ prefix):
+OAuth 2.0 Authorization Server (MCP Auth Spec 2025-03-26):
   GET  /.well-known/oauth-authorization-server  — RFC 8414 metadata
+  GET  /.well-known/oauth-protected-resource
   POST /register                                — RFC 7591 Dynamic Client Registration
-  GET  /authorize                               — authorization endpoint (proxies to Google)
-  GET  /oauth/callback                          — Google OAuth callback (internal)
-  POST /token                                   — token endpoint
+  GET  /authorize                               — shows connect page, creates session
+  GET  /auth/google                             — initiates Google OAuth
+  GET  /oauth/callback                          — Google redirects here
+  POST /token                                   — issues MCP access token
+
+  PKCE design: code_verifier is Fernet-encrypted into the Google OAuth state
+  parameter — no /tmp storage needed, survives server restarts.
 
 MCP Streamable HTTP:
-  POST /mcp   — JSON-RPC dispatcher (requires Bearer token)
-  GET  /mcp   — SSE keepalive channel
+  POST /mcp   — JSON-RPC dispatcher
+  GET  /mcp   — SSE keepalive
 """
 
 import base64
@@ -18,7 +23,6 @@ import hashlib
 import json
 import os
 import secrets
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -27,7 +31,6 @@ from typing import Any, Optional
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-
 load_dotenv()
 
 from fastapi import FastAPI, Request
@@ -38,10 +41,11 @@ from src.auth import (
     google_auth_url,
     google_exchange_code,
     credentials_from_token_data,
+    _creds_to_dict,
+    decrypt_state,
 )
 from src.storage import (
     save_client, load_client,
-    save_oauth_session, load_oauth_session, delete_oauth_session,
     save_auth_code, load_auth_code, delete_auth_code,
     save_access_token, load_access_token,
     save_token, load_token,
@@ -51,155 +55,209 @@ import src.ga_tools as ga
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
+# ─── MCP Tool definitions ─────────────────────────────────────────────────────
 
-# ─── MCP Tool definitions (JSON Schema) ──────────────────────────────────────
+_PROPERTY_ID = {
+    "type": ["integer", "string"],
+    "description": "GA4 property ID — a number (123456789) or 'properties/123456789'",
+}
 
 TOOLS = [
+    {
+        "name": "get_account_summaries",
+        "description": "List all GA4 accounts and properties the user has access to. Call this first to discover property IDs.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_property_details",
+        "description": "Returns full details for a specific GA4 property (time zone, currency, industry, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": _PROPERTY_ID},
+            "required": ["property_id"],
+        },
+    },
+    {
+        "name": "list_google_ads_links",
+        "description": "Lists Google Ads account links for a GA4 property.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": _PROPERTY_ID},
+            "required": ["property_id"],
+        },
+    },
+    {
+        "name": "list_property_annotations",
+        "description": "Returns date annotations for a GA4 property (release notes, campaign launches, traffic anomalies, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": _PROPERTY_ID},
+            "required": ["property_id"],
+        },
+    },
     {
         "name": "run_report",
         "description": (
             "Run a GA4 Data API report. "
-            "Top pages: dimensions=['pagePath'], metrics=['screenPageViews','sessions']. "
+            "Examples — top pages: dimensions=['pagePath'], metrics=['screenPageViews','sessions']. "
             "Traffic sources: dimensions=['sessionSource','sessionMedium'], metrics=['sessions','conversions']. "
-            "Countries: dimensions=['country'], metrics=['sessions','newUsers']."
+            "Countries: dimensions=['country'], metrics=['sessions','newUsers']. "
+            "Relative dates: '7daysAgo', '30daysAgo', 'yesterday', 'today'. "
+            "Absolute dates: 'YYYY-MM-DD'."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "property_id": {"type": "string", "description": "GA4 property ID, e.g. '123456789'"},
-                "dimensions": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['pagePath','country','deviceCategory']"},
-                "metrics": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['sessions','conversions','totalRevenue','screenPageViews']"},
-                "start_date": {"type": "string", "default": "7daysAgo", "description": "e.g. '7daysAgo', '30daysAgo', '2024-01-01'"},
-                "end_date": {"type": "string", "default": "today", "description": "e.g. 'today', 'yesterday'"},
-                "limit": {"type": "integer", "default": 10},
+                "property_id": _PROPERTY_ID,
+                "date_ranges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start_date": {"type": "string"},
+                            "end_date": {"type": "string"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["start_date", "end_date"],
+                    },
+                    "description": "e.g. [{'start_date':'7daysAgo','end_date':'today'}]",
+                },
+                "dimensions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "e.g. ['pagePath', 'country', 'deviceCategory', 'sessionSource']",
+                },
+                "metrics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "e.g. ['sessions', 'screenPageViews', 'conversions', 'totalRevenue', 'newUsers']",
+                },
+                "dimension_filter": {
+                    "type": "object",
+                    "description": "FilterExpression for dimensions (see GA4 Data API docs)",
+                },
+                "metric_filter": {
+                    "type": "object",
+                    "description": "FilterExpression for metrics (see GA4 Data API docs)",
+                },
+                "order_bys": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "List of OrderBy objects",
+                },
+                "limit": {"type": "integer", "description": "Max rows (default: all)"},
+                "offset": {"type": "integer", "description": "Row offset for pagination"},
+                "currency_code": {"type": "string", "description": "ISO4217 currency code, e.g. 'EUR'"},
+                "return_property_quota": {"type": "boolean"},
+            },
+            "required": ["property_id", "date_ranges", "dimensions", "metrics"],
+        },
+    },
+    {
+        "name": "run_realtime_report",
+        "description": "Run a GA4 realtime report showing live active users. Use realtime dimensions/metrics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "property_id": _PROPERTY_ID,
+                "dimensions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Realtime dimensions, e.g. ['country', 'deviceCategory', 'unifiedScreenName']",
+                },
+                "metrics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Realtime metrics, e.g. ['activeUsers']",
+                },
+                "dimension_filter": {"type": "object"},
+                "metric_filter": {"type": "object"},
+                "order_bys": {"type": "array", "items": {"type": "object"}},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+                "return_property_quota": {"type": "boolean"},
             },
             "required": ["property_id", "dimensions", "metrics"],
         },
     },
     {
-        "name": "get_account_summaries",
-        "description": "List all GA4 accounts and properties the user has access to. Call this first to discover property IDs.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "add_referral_exclusion",
-        "description": "Exclude a domain from referral traffic (e.g. 'paypal.com', 'checkout.stripe.com') to prevent session inflation.",
+        "name": "get_custom_dimensions_and_metrics",
+        "description": "Returns the property's custom dimensions and metrics. Use before run_report to find custom field names.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "property_id": {"type": "string"},
-                "domain": {"type": "string", "description": "e.g. 'paypal.com'"},
-            },
-            "required": ["property_id", "domain"],
-        },
-    },
-    {
-        "name": "create_conversion_event",
-        "description": "Mark an existing GA4 event as a conversion event.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "property_id": {"type": "string"},
-                "event_name": {"type": "string", "description": "e.g. 'purchase', 'sign_up', 'form_submit'"},
-            },
-            "required": ["property_id", "event_name"],
-        },
-    },
-    {
-        "name": "create_audience",
-        "description": "Create a GA4 audience for remarketing or analysis.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "property_id": {"type": "string"},
-                "display_name": {"type": "string"},
-                "description": {"type": "string"},
-                "membership_duration_days": {"type": "integer", "description": "1–540"},
-                "filter_clauses": {"type": "array", "items": {"type": "object"}},
-            },
-            "required": ["property_id", "display_name", "description", "membership_duration_days", "filter_clauses"],
-        },
-    },
-    {
-        "name": "update_property_settings",
-        "description": "Update GA4 property name, industry category, timezone, or currency.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "property_id": {"type": "string"},
-                "display_name": {"type": "string"},
-                "industry_category": {"type": "string", "description": "e.g. TECHNOLOGY, RETAIL, FINANCE, HEALTHCARE"},
-                "time_zone": {"type": "string", "description": "e.g. 'Europe/Berlin'"},
-                "currency_code": {"type": "string", "description": "e.g. 'EUR', 'USD'"},
-            },
+            "properties": {"property_id": _PROPERTY_ID},
             "required": ["property_id"],
         },
     },
 ]
 
+# ─── Tool dispatcher ──────────────────────────────────────────────────────────
 
-# ─── MCP tool dispatcher ──────────────────────────────────────────────────────
-
-async def _dispatch_tool(name: str, args: dict, creds) -> Any:
-    if name == "run_report":
-        return ga.run_report(
-            credentials=creds,
-            property_id=args["property_id"],
-            dimensions=args["dimensions"],
-            metrics=args["metrics"],
-            date_ranges=[{"start_date": args.get("start_date", "7daysAgo"), "end_date": args.get("end_date", "today")}],
-            limit=args.get("limit", 10),
-        )
+async def _dispatch(name: str, args: dict, creds) -> Any:
     if name == "get_account_summaries":
-        return ga.get_account_summaries(credentials=creds)
-    if name == "add_referral_exclusion":
-        return ga.add_referral_exclusion(credentials=creds, property_id=args["property_id"], domain=args["domain"])
-    if name == "create_conversion_event":
-        return ga.create_conversion_event(credentials=creds, property_id=args["property_id"], event_name=args["event_name"])
-    if name == "create_audience":
-        return ga.create_audience(
-            credentials=creds,
-            property_id=args["property_id"],
-            display_name=args["display_name"],
-            description=args["description"],
-            membership_duration_days=args["membership_duration_days"],
-            filter_clauses=args["filter_clauses"],
-        )
-    if name == "update_property_settings":
-        return ga.update_property_settings(
-            credentials=creds,
-            property_id=args["property_id"],
-            display_name=args.get("display_name"),
-            industry_category=args.get("industry_category"),
-            time_zone=args.get("time_zone"),
+        return await ga.get_account_summaries(creds)
+    if name == "get_property_details":
+        return await ga.get_property_details(creds, args["property_id"])
+    if name == "list_google_ads_links":
+        return await ga.list_google_ads_links(creds, args["property_id"])
+    if name == "list_property_annotations":
+        return await ga.list_property_annotations(creds, args["property_id"])
+    if name == "run_report":
+        return await ga.run_report(
+            creds,
+            args["property_id"],
+            args["date_ranges"],
+            args["dimensions"],
+            args["metrics"],
+            dimension_filter=args.get("dimension_filter"),
+            metric_filter=args.get("metric_filter"),
+            order_bys=args.get("order_bys"),
+            limit=args.get("limit"),
+            offset=args.get("offset"),
             currency_code=args.get("currency_code"),
+            return_property_quota=args.get("return_property_quota", False),
         )
+    if name == "run_realtime_report":
+        return await ga.run_realtime_report(
+            creds,
+            args["property_id"],
+            args["dimensions"],
+            args["metrics"],
+            dimension_filter=args.get("dimension_filter"),
+            metric_filter=args.get("metric_filter"),
+            order_bys=args.get("order_bys"),
+            limit=args.get("limit"),
+            offset=args.get("offset"),
+            return_property_quota=args.get("return_property_quota", False),
+        )
+    if name == "get_custom_dimensions_and_metrics":
+        return await ga.get_custom_dimensions_and_metrics(creds, args["property_id"])
     raise ValueError(f"Unknown tool: {name}")
 
 
-async def _handle_jsonrpc(msg: dict, creds, session_id: str) -> Optional[dict]:
-    """Handle one JSON-RPC message. Returns None for notifications."""
+# ─── JSON-RPC handler ─────────────────────────────────────────────────────────
+
+async def _handle(msg: dict, creds, session_id: str) -> Optional[dict]:
     method = msg.get("method", "")
     params = msg.get("params", {})
     msg_id = msg.get("id")
-
     if msg_id is None:
-        return None  # notification — no response
+        return None  # notification
 
     try:
         if method == "initialize":
             result = {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "google-analytics", "version": "1.0.0"},
+                "serverInfo": {"name": "google-analytics", "version": "2.0.0"},
             }
         elif method == "ping":
             result = {}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
-            tool_result = await _dispatch_tool(params["name"], params.get("arguments", {}), creds)
-            result = {"content": [{"type": "text", "text": json.dumps(tool_result, indent=2, ensure_ascii=False)}]}
+            output = await _dispatch(params["name"], params.get("arguments", {}), creds)
+            result = {"content": [{"type": "text", "text": json.dumps(output, indent=2, ensure_ascii=False)}]}
         else:
             return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -207,29 +265,45 @@ async def _handle_jsonrpc(msg: dict, creds, session_id: str) -> Optional[dict]:
         return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(exc)}}
 
 
-def _resolve_bearer(request: Request) -> Optional[str]:
+# ─── Auth helpers ─────────────────────────────────────────────────────────────
+
+def _bearer(request: Request) -> Optional[str]:
     auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return None
+    return auth[7:].strip() if auth.lower().startswith("bearer ") else None
 
 
-def _unauthorized_response(session_id: str = "") -> Response:
-    """Return 401 with WWW-Authenticate pointing to our auth server."""
-    if not session_id:
-        session_id = str(uuid.uuid4())
+def _unauthorized(session_id: str = "") -> Response:
     return Response(
-        content=json.dumps({"error": "unauthorized", "error_description": "Bearer token required"}),
+        content=json.dumps({"error": "unauthorized"}),
         status_code=401,
         media_type="application/json",
         headers={
-            "mcp-session-id": session_id,
+            "mcp-session-id": session_id or str(uuid.uuid4()),
             "WWW-Authenticate": (
                 f'Bearer realm="google-analytics", '
                 f'resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
             ),
         },
     )
+
+
+def _ga4_missing(msg: dict, user_id: str) -> dict:
+    link = f"{BASE_URL}/auth/google?user_id={user_id}" if user_id else f"{BASE_URL}/status"
+    return {
+        "jsonrpc": "2.0",
+        "id": msg.get("id"),
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": (
+                    "⚠️ Google Analytics is not connected yet.\n\n"
+                    f"Please authorize your GA4 account:\n{link}\n\n"
+                    "After connecting, try again."
+                ),
+            }],
+            "isError": True,
+        },
+    }
 
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
@@ -240,12 +314,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(
-    title="Google Analytics MCP Server",
-    description="MCP Auth Spec 2025-03-26 — GA4 Data + Admin API",
-    lifespan=lifespan,
-)
-
+app = FastAPI(title="Google Analytics MCP Server", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -258,8 +327,7 @@ app.add_middleware(
 # ─── OAuth 2.0 Authorization Server Metadata (RFC 8414) ──────────────────────
 
 @app.get("/.well-known/oauth-authorization-server")
-async def oauth_authorization_server_metadata():
-    # Paths MUST match the MCP spec default fallbacks: /authorize, /token, /register
+async def oauth_metadata():
     return JSONResponse({
         "issuer": BASE_URL,
         "authorization_endpoint": f"{BASE_URL}/authorize",
@@ -270,26 +338,23 @@ async def oauth_authorization_server_metadata():
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
-        "service_documentation": f"{BASE_URL}/status",
     })
 
 
 @app.get("/.well-known/oauth-protected-resource")
-async def oauth_protected_resource_metadata():
-    """RFC 9728 — tells clients where to find the auth server."""
+async def oauth_protected_resource():
     return JSONResponse({
         "resource": f"{BASE_URL}/mcp",
         "authorization_servers": [BASE_URL],
         "scopes_supported": ["analytics"],
         "bearer_methods_supported": ["header"],
-        "resource_name": "Google Analytics MCP Server",
     })
 
 
 # ─── Dynamic Client Registration (RFC 7591) ───────────────────────────────────
 
 @app.post("/register")
-async def oauth_register(request: Request):
+async def register(request: Request):
     try:
         body = await request.json()
     except Exception:
@@ -300,22 +365,18 @@ async def oauth_register(request: Request):
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uris required"}, status_code=400)
 
     client_id = str(uuid.uuid4())
-    client_secret = secrets.token_urlsafe(32)
-    issued_at = int(time.time())
-
     auth_method = body.get("token_endpoint_auth_method", "client_secret_post")
     client_data = {
         "client_id": client_id,
-        "client_id_issued_at": issued_at,
+        "client_id_issued_at": int(time.time()),
         "redirect_uris": redirect_uris,
         "client_name": body.get("client_name", "MCP Client"),
         "grant_types": body.get("grant_types", ["authorization_code"]),
         "response_types": body.get("response_types", ["code"]),
         "token_endpoint_auth_method": auth_method,
     }
-    # Only include client_secret for confidential clients
     if auth_method != "none":
-        client_data["client_secret"] = client_secret
+        client_data["client_secret"] = secrets.token_urlsafe(32)
 
     save_client(client_id, client_data)
     return JSONResponse(client_data, status_code=201)
@@ -324,7 +385,7 @@ async def oauth_register(request: Request):
 # ─── Authorization endpoint ───────────────────────────────────────────────────
 
 @app.get("/authorize")
-async def oauth_authorize(
+async def authorize(
     request: Request,
     response_type: str = "code",
     client_id: Optional[str] = None,
@@ -337,26 +398,23 @@ async def oauth_authorize(
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
-    # Validate redirect_uri against registered client if client is found in storage.
     if client_id and redirect_uri:
         client = load_client(client_id)
         if client and redirect_uri not in client["redirect_uris"]:
             return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri mismatch"}, status_code=400)
 
-    # Stable user_id ties this MCP session to GA4 credentials
     user_id = secrets.token_urlsafe(16)
-    session_key = secrets.token_urlsafe(24)
-    save_oauth_session(session_key, {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "client_state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "user_id": user_id,
-    })
 
-    # Show consent page — user must connect their GA4 account before proceeding
-    ga_auth_url = f"{BASE_URL}/auth/google?user_id={user_id}&session_key={session_key}"
+    # All session data is passed to /auth/google via query params — no /tmp needed
+    ga_auth_params = urlencode({
+        "user_id": user_id,
+        "client_id": client_id or "",
+        "redirect_uri": redirect_uri or "",
+        "client_state": state or "",
+        "code_challenge": code_challenge or "",
+    })
+    ga_auth_link = f"{BASE_URL}/auth/google?{ga_auth_params}"
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><title>Connect Google Analytics</title>
 <style>
@@ -371,28 +429,52 @@ async def oauth_authorize(
 <body>
   <div style="font-size:2.5em;margin-bottom:12px">📊</div>
   <h1>Google Analytics MCP</h1>
-  <p>To use Google Analytics tools in Claude,<br>connect your Google Analytics account.</p>
-  <a class="btn" href="{ga_auth_url}">Connect Google Analytics</a>
-  <p class="note">You will be redirected to Google to grant read/write access<br>to your Analytics properties.</p>
+  <p>Connect your Google Analytics account to use GA4 tools in Claude.</p>
+  <a class="btn" href="{ga_auth_link}">Connect Google Analytics</a>
+  <p class="note">Read-only access to your Analytics properties.</p>
 </body></html>""")
 
 
-# ─── GA4 OAuth (user-facing, separate from MCP auth) ─────────────────────────
+# ─── GA4 OAuth (encrypted PKCE state, no /tmp) ───────────────────────────────
 
 @app.get("/auth/google")
-async def auth_google(user_id: str, session_key: Optional[str] = None):
+async def auth_google(
+    user_id: str,
+    client_id: str = "",
+    redirect_uri: str = "",
+    client_state: str = "",
+    code_challenge: str = "",
+):
     """
-    Start Google OAuth for a specific user_id.
-    - Initial flow: called from the /authorize consent page with session_key
-    - Reconnect flow: called from a tool error link with just user_id
-    State passed to Google = "session_key:user_id" (initial) or "user_id" (reconnect).
+    Initiate Google OAuth.
+    All session data + PKCE verifier are encrypted into the state parameter —
+    no /tmp storage needed.
     """
-    if not user_id:
-        return HTMLResponse("<h1>Bad Request</h1><p>user_id required.</p>", status_code=400)
+    session_payload = {
+        "user_id": user_id,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "client_state": client_state,
+        "code_challenge": code_challenge,  # client's PKCE challenge (for /token verification)
+    }
+    return RedirectResponse(url=google_auth_url(session_payload))
 
-    # Encode both pieces into the Google OAuth state so the callback can recover them
-    google_state = f"{session_key}:{user_id}" if session_key else user_id
-    return RedirectResponse(url=google_auth_url(google_state))
+
+@app.get("/auth/google/reconnect")
+async def auth_google_reconnect(user_id: str):
+    """
+    Re-authorize GA4 for an existing MCP session (e.g. after server restart).
+    No MCP session data needed — just refreshes the GA4 token for user_id.
+    """
+    session_payload = {
+        "user_id": user_id,
+        "client_id": "",
+        "redirect_uri": "",
+        "client_state": "",
+        "code_challenge": "",
+        "reconnect": True,
+    }
+    return RedirectResponse(url=google_auth_url(session_payload))
 
 
 # ─── Google OAuth callback ────────────────────────────────────────────────────
@@ -409,69 +491,67 @@ async def oauth_callback(
     if not code or not state:
         return HTMLResponse("<h1>Bad Request</h1><p>Missing code or state.</p>", status_code=400)
 
-    # Exchange Google auth code for GA4 tokens
+    # Decrypt the Fernet-encrypted state (contains session + PKCE verifier)
     try:
-        google_tokens = google_exchange_code(code, state)
+        session = decrypt_state(state)
+    except Exception:
+        return HTMLResponse(
+            "<h1>Invalid State</h1><p>Could not decrypt OAuth state. Please try connecting again.</p>",
+            status_code=400,
+        )
+
+    user_id = session.get("user_id", "")
+    pkce_verifier = session.get("pkce_verifier", "")
+
+    # Exchange Google authorization code (with PKCE verifier from encrypted state)
+    try:
+        ga4_tokens = google_exchange_code(code, pkce_verifier)
     except Exception as e:
         return HTMLResponse(f"<h1>Token Exchange Failed</h1><p>{e}</p>", status_code=400)
 
-    if ":" in state:
-        # ── Initial flow: state = "session_key:user_id" ──
-        session_key, user_id = state.split(":", 1)
-        session = load_oauth_session(session_key)
-        if not session:
-            return HTMLResponse(
-                "<h1>Session Expired</h1>"
-                "<p>The session was lost (server may have restarted). "
-                "Please start the connection again from claude.ai.</p>",
-                status_code=400,
-            )
-        delete_oauth_session(session_key)
+    # Persist GA4 token for this user
+    save_token(user_id, ga4_tokens)
 
-        # Persist GA4 token for this user
-        save_token(user_id, google_tokens)
-
-        # Issue MCP auth code carrying user_id (not google_tokens)
-        auth_code = secrets.token_urlsafe(32)
-        save_auth_code(auth_code, {
-            "client_id": session.get("client_id"),
-            "redirect_uri": session.get("redirect_uri"),
-            "code_challenge": session.get("code_challenge"),
-            "code_challenge_method": session.get("code_challenge_method", "S256"),
-            "user_id": user_id,
-        })
-
-        redirect_uri = session.get("redirect_uri")
-        client_state = session.get("client_state")
-        if redirect_uri:
-            params: dict = {"code": auth_code}
-            if client_state:
-                params["state"] = client_state
-            return RedirectResponse(url=f"{redirect_uri}?{urlencode(params)}")
-        return HTMLResponse(f"<h1>Authorized</h1><p>Code: <code>{auth_code}</code></p>")
-
-    else:
-        # ── Reconnect flow: state = "user_id" ──
-        user_id = state
-        save_token(user_id, google_tokens)
+    # Reconnect flow: just show success
+    if session.get("reconnect"):
         return HTMLResponse("""<!DOCTYPE html>
-<html><head><title>GA4 Connected</title>
+<html><head><title>GA4 Reconnected</title>
 <style>body{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 24px;text-align:center}
-.ok{color:#16a34a;font-size:2em}</style></head>
+.ok{color:#16a34a;font-size:2.5em}</style></head>
 <body>
   <div class="ok">✓</div>
-  <h1>Google Analytics Connected</h1>
-  <p>Your GA4 account has been linked. You can now use Google Analytics tools in Claude.</p>
+  <h1>Google Analytics Reconnected</h1>
+  <p>Your GA4 account has been re-linked. You can now use Google Analytics tools in Claude.</p>
   <p style="color:#888;font-size:.9em">You may close this tab.</p>
 </body></html>""")
+
+    # Initial flow: issue MCP auth code and redirect back to claude.ai
+    redirect_uri = session.get("redirect_uri", "")
+    client_state = session.get("client_state", "")
+
+    auth_code = secrets.token_urlsafe(32)
+    save_auth_code(auth_code, {
+        "client_id": session.get("client_id"),
+        "redirect_uri": redirect_uri,
+        "code_challenge": session.get("code_challenge"),
+        "user_id": user_id,
+    })
+
+    if redirect_uri:
+        params: dict = {"code": auth_code}
+        if client_state:
+            params["state"] = client_state
+        return RedirectResponse(url=f"{redirect_uri}?{urlencode(params)}")
+
+    return HTMLResponse(f"<h1>Authorized</h1><p>Code: <code>{auth_code}</code></p>")
 
 
 # ─── Token endpoint ───────────────────────────────────────────────────────────
 
 @app.post("/token")
-async def oauth_token(request: Request):
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
+async def token(request: Request):
+    ct = request.headers.get("content-type", "")
+    if "application/json" in ct:
         try:
             body = await request.json()
         except Exception:
@@ -480,15 +560,10 @@ async def oauth_token(request: Request):
         form = await request.form()
         body = dict(form)
 
-    grant_type = body.get("grant_type")
-    if grant_type != "authorization_code":
+    if body.get("grant_type") != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
     code = body.get("code")
-    client_id = body.get("client_id")
-    redirect_uri = body.get("redirect_uri")
-    code_verifier = body.get("code_verifier")
-
     if not code:
         return JSONResponse({"error": "invalid_request", "error_description": "code required"}, status_code=400)
 
@@ -496,17 +571,18 @@ async def oauth_token(request: Request):
     if not code_data:
         return JSONResponse({"error": "invalid_grant", "error_description": "code not found or expired"}, status_code=400)
 
-    # Verify client_id matches
+    client_id = body.get("client_id")
     if client_id and code_data.get("client_id") and client_id != code_data["client_id"]:
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
-    # Verify redirect_uri matches
+    redirect_uri = body.get("redirect_uri")
     if redirect_uri and code_data.get("redirect_uri") and redirect_uri != code_data["redirect_uri"]:
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
-    # Verify PKCE
+    # Verify PKCE (client's code_verifier against code_challenge stored in auth code)
     stored_challenge = code_data.get("code_challenge")
     if stored_challenge:
+        code_verifier = body.get("code_verifier")
         if not code_verifier:
             return JSONResponse({"error": "invalid_request", "error_description": "code_verifier required"}, status_code=400)
         computed = base64.urlsafe_b64encode(
@@ -515,9 +591,8 @@ async def oauth_token(request: Request):
         if computed != stored_challenge:
             return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, status_code=400)
 
-    # Issue our access token (stores user_id, not google_tokens — GA4 token lives separately)
     access_token = secrets.token_urlsafe(40)
-    expires_in = 86400 * 30  # 30 days
+    expires_in = 86400 * 30
 
     save_access_token(access_token, {
         "client_id": code_data.get("client_id"),
@@ -535,31 +610,27 @@ async def oauth_token(request: Request):
     })
 
 
-# ─── MCP Streamable HTTP endpoints ───────────────────────────────────────────
+# ─── MCP Streamable HTTP ──────────────────────────────────────────────────────
 
 @app.post("/mcp")
 async def mcp_post(request: Request):
     session_id = request.headers.get("mcp-session-id", str(uuid.uuid4()))
-    bearer = _resolve_bearer(request)
+    token_str = _bearer(request)
 
-    # Two-layer auth:
-    #   mcp_authed  = bearer token is known to our server (MCP-level auth)
-    #   creds       = Google Analytics credentials (GA4-level auth)
     mcp_authed = False
     user_id = None
     creds = None
 
-    if bearer:
-        token_data = load_access_token(bearer)
+    if token_str:
+        token_data = load_access_token(token_str)
         if token_data:
             mcp_authed = True
             user_id = token_data.get("user_id")
             if user_id:
-                ga4_token_data = load_token(user_id)
-                if ga4_token_data:
+                ga4 = load_token(user_id)
+                if ga4:
                     creds = credentials_from_token_data(
-                        ga4_token_data,
-                        bearer,
+                        ga4, user_id,
                         lambda updates: save_token(user_id, updates),
                     )
 
@@ -572,60 +643,34 @@ async def mcp_post(request: Request):
         )
 
     headers = {"mcp-session-id": session_id}
-
-    # Methods that don't need any auth
     NO_AUTH = ("initialize", "ping", "notifications/initialized", "tools/list", None)
 
-    def _needs_mcp_auth(msg: dict) -> bool:
+    def needs_mcp(msg):
         return msg.get("method") not in NO_AUTH
 
-    def _is_tool_call(msg: dict) -> bool:
+    def is_tool_call(msg):
         return msg.get("method") == "tools/call"
 
-    def _ga4_missing_error(msg: dict) -> dict:
-        """Return a tools/call result telling the user to connect GA4."""
-        auth_link = f"{BASE_URL}/auth/google?user_id={user_id}" if user_id else f"{BASE_URL}/status"
-        return {
-            "jsonrpc": "2.0",
-            "id": msg.get("id"),
-            "result": {
-                "content": [{
-                    "type": "text",
-                    "text": (
-                        "⚠️ Google Analytics is not connected yet.\n\n"
-                        "Please authorize your GA4 account by opening this link:\n\n"
-                        f"{auth_link}\n\n"
-                        "After connecting, try again."
-                    ),
-                }],
-                "isError": True,
-            },
-        }
-
     if isinstance(body, list):
-        # 401 only if MCP token is missing for methods that need it
-        if any(_needs_mcp_auth(m) for m in body) and not mcp_authed:
-            return _unauthorized_response(session_id)
+        if any(needs_mcp(m) for m in body) and not mcp_authed:
+            return _unauthorized(session_id)
         responses = []
         for m in body:
-            if _is_tool_call(m) and not creds:
-                responses.append(_ga4_missing_error(m))
+            if is_tool_call(m) and not creds:
+                responses.append(_ga4_missing(m, user_id or ""))
             else:
-                r = await _handle_jsonrpc(m, creds, session_id)
+                r = await _handle(m, creds, session_id)
                 if r is not None:
                     responses.append(r)
-        if not responses:
-            return Response(status_code=202, headers=headers)
-        return JSONResponse(content=responses, headers=headers)
+        return (Response(status_code=202, headers=headers) if not responses
+                else JSONResponse(content=responses, headers=headers))
 
-    # Single message
-    if _needs_mcp_auth(body) and not mcp_authed:
-        return _unauthorized_response(session_id)
+    if needs_mcp(body) and not mcp_authed:
+        return _unauthorized(session_id)
+    if is_tool_call(body) and not creds:
+        return JSONResponse(content=_ga4_missing(body, user_id or ""), headers=headers)
 
-    if _is_tool_call(body) and not creds:
-        return JSONResponse(content=_ga4_missing_error(body), headers=headers)
-
-    response = await _handle_jsonrpc(body, creds, session_id)
+    response = await _handle(body, creds, session_id)
     if response is None:
         return Response(status_code=202, headers=headers)
     return JSONResponse(content=response, headers=headers)
@@ -633,12 +678,11 @@ async def mcp_post(request: Request):
 
 @app.get("/mcp")
 async def mcp_get(request: Request):
-    """SSE channel for server-initiated messages (required by MCP spec)."""
-    bearer = _resolve_bearer(request)
+    token_str = _bearer(request)
     session_id = request.headers.get("mcp-session-id", str(uuid.uuid4()))
 
-    if not bearer or not load_access_token(bearer):
-        return _unauthorized_response(session_id)
+    if not token_str or not load_access_token(token_str):
+        return _unauthorized(session_id)
 
     async def keepalive():
         yield ": keepalive\n\n"
@@ -652,37 +696,40 @@ async def mcp_get(request: Request):
 
 # ─── Status & Health ──────────────────────────────────────────────────────────
 
-
 @app.get("/status", response_class=HTMLResponse)
 async def status():
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><title>GA MCP — Status</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:700px;margin:60px auto;padding:0 20px}}
 code{{background:#f0f0f0;padding:2px 6px;border-radius:4px}}
-table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px 12px}}th{{background:#f5f5f5}}</style>
+a{{color:#4285f4}}</style>
 </head><body>
   <h1>Google Analytics MCP Server</h1>
-  <p><strong style="color:#16a34a">Running</strong> &nbsp;|&nbsp; MCP Auth Spec <code>{MCP_PROTOCOL_VERSION}</code></p>
-  <p>Auth metadata: <code><a href="/.well-known/oauth-authorization-server">/.well-known/oauth-authorization-server</a></code></p>
+  <p><strong style="color:#16a34a">Running</strong> &nbsp;|&nbsp;
+     MCP Auth Spec <code>{MCP_PROTOCOL_VERSION}</code> &nbsp;|&nbsp;
+     <a href="/.well-known/oauth-authorization-server">OAuth Metadata</a></p>
   <p>MCP endpoint: <code>{BASE_URL}/mcp</code></p>
+
+  <h2>Tools (7)</h2>
+  <ul>{''.join(f"<li><code>{t['name']}</code></li>" for t in TOOLS)}</ul>
 
   <h2>OAuth Flow (claude.ai)</h2>
   <ol>
-    <li>claude.ai fetches <code>/.well-known/oauth-authorization-server</code></li>
+    <li>claude.ai discovers <code>/.well-known/oauth-authorization-server</code></li>
     <li>Registers via <code>POST /register</code></li>
-    <li>Redirects user to <code>/authorize</code> → Google OAuth</li>
-    <li>Exchanges code at <code>POST /token</code> for Bearer token</li>
+    <li>User visits <code>/authorize</code> → clicks "Connect Google Analytics"</li>
+    <li><code>/auth/google</code> → Google OAuth (PKCE verifier encrypted in state)</li>
+    <li>Callback → GA4 token saved, MCP auth code issued → redirected to claude.ai</li>
+    <li>claude.ai exchanges code at <code>POST /token</code></li>
     <li>Uses Bearer token on <code>POST /mcp</code></li>
   </ol>
-
-  <h2>Active MCP Sessions</h2>
-  <p>Sessions are stored in <code>/tmp/ga_tokens/</code> (ephemeral on Render free tier).</p>
+  <p>Re-authorize GA4: <code>{BASE_URL}/auth/google/reconnect?user_id=&lt;id&gt;</code></p>
 </body></html>""")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "protocol": MCP_PROTOCOL_VERSION}
+    return {"status": "ok", "protocol": MCP_PROTOCOL_VERSION, "tools": len(TOOLS)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -692,7 +739,7 @@ async def root():
 <style>body{{font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;padding:0 20px}}</style>
 </head><body>
   <h1>Google Analytics MCP Server</h1>
-  <p>MCP Auth Spec <code>{MCP_PROTOCOL_VERSION}</code></p>
+  <p>MCP Auth Spec <code>{MCP_PROTOCOL_VERSION}</code> &mdash; 7 read-only tools</p>
   <ul>
     <li><a href="/.well-known/oauth-authorization-server">OAuth Metadata</a></li>
     <li><a href="/status">Server Status</a></li>

@@ -40,14 +40,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from src.auth import (
     google_auth_url,
     google_exchange_code,
-    credentials_from_token_data,
-    _creds_to_dict,
+    encrypt_mcp_token,
+    decrypt_mcp_token,
+    credentials_from_refresh_token,
     decrypt_state,
 )
 from src.storage import (
     save_client, load_client,
     save_auth_code, load_auth_code, delete_auth_code,
-    save_access_token, load_access_token,
     save_token, load_token,
 )
 import src.ga_tools as ga
@@ -591,14 +591,24 @@ async def token(request: Request):
         if computed != stored_challenge:
             return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, status_code=400)
 
-    access_token = secrets.token_urlsafe(40)
-    expires_in = 86400 * 30
+    # Load GA4 tokens to embed refresh_token inside the MCP access token.
+    # This makes the token self-contained — no /tmp lookup needed on future calls,
+    # so the token survives server restarts on Render free tier.
+    user_id = code_data["user_id"]
+    ga4 = load_token(user_id)
+    refresh_token = ga4.get("refresh_token") if ga4 else None
+    if not refresh_token:
+        return JSONResponse(
+            {"error": "server_error", "error_description": "GA4 refresh_token not found — please re-authorize at /auth/google/reconnect"},
+            status_code=500,
+        )
 
-    save_access_token(access_token, {
+    expires_in = 86400 * 365  # 1 year (refresh_token is the real long-lived credential)
+    access_token = encrypt_mcp_token({
+        "user_id": user_id,
         "client_id": code_data.get("client_id"),
-        "user_id": code_data["user_id"],
+        "refresh_token": refresh_token,
         "issued_at": time.time(),
-        "expires_at": time.time() + expires_in,
     })
     delete_auth_code(code)
 
@@ -622,17 +632,16 @@ async def mcp_post(request: Request):
     creds = None
 
     if token_str:
-        token_data = load_access_token(token_str)
-        if token_data:
+        try:
+            # Token is self-contained: Fernet-encrypted {user_id, refresh_token}
+            token_data = decrypt_mcp_token(token_str)
             mcp_authed = True
-            user_id = token_data.get("user_id")
-            if user_id:
-                ga4 = load_token(user_id)
-                if ga4:
-                    creds = credentials_from_token_data(
-                        ga4, user_id,
-                        lambda updates: save_token(user_id, updates),
-                    )
+            user_id = token_data.get("user_id", "")
+            refresh_token = token_data.get("refresh_token", "")
+            if refresh_token:
+                creds = await credentials_from_refresh_token(refresh_token, user_id)
+        except Exception:
+            mcp_authed = False  # tampered / wrong key → treat as missing token
 
     try:
         body = await request.json()
@@ -681,7 +690,11 @@ async def mcp_get(request: Request):
     token_str = _bearer(request)
     session_id = request.headers.get("mcp-session-id", str(uuid.uuid4()))
 
-    if not token_str or not load_access_token(token_str):
+    try:
+        if not token_str:
+            raise ValueError("no token")
+        decrypt_mcp_token(token_str)  # just validate signature
+    except Exception:
         return _unauthorized(session_id)
 
     async def keepalive():
